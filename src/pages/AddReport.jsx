@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { logAction } from '../utils/logger';
+import { calculateReport, validateReport } from '../utils/calculations';
 import ConfirmDialog from '../components/ConfirmDialog';
 import LoadingScreen from '../components/LoadingScreen';
 
@@ -65,6 +66,7 @@ const AddReport = () => {
   });
 
   const [alerts, setAlerts] = useState([]);
+  const [validationResult, setValidationResult] = useState(null);
   const [stations, setStations] = useState([]);
   const [isMaintenance, setIsMaintenance] = useState(false);
 
@@ -144,41 +146,40 @@ const AddReport = () => {
     }
   }, [id]);
 
-  const calculateHours = (start, end) => {
-    if (!start || !end) return 0;
-    try {
-      const parsedStart = parse(start, 'HH:mm', new Date());
-      const parsedEnd = parse(end, 'HH:mm', new Date());
-      let diff = (parsedEnd - parsedStart) / (1000 * 60 * 60);
-      if (diff < 0) diff += 24; 
-      return Number(diff.toFixed(2));
-    } catch { return 0; }
-  };
-
   useEffect(() => {
-    const hours = calculateHours(formData.startTime, formData.endTime);
-    const consumed = hours * FUEL_RATE;
-    const currentBal = Number(formData.previousFuelBalance) + Number(formData.fuelAdded) + Number(formData.fuelFromMunicipality) - consumed - Number(formData.fuelDifference);
-    const dailyProd = Number(formData.afterFilterProduction) * hours;
-    const subTotal = Number(formData.submersibleProduction) * hours;
-    const wasteAmt = Math.max(0, subTotal - dailyProd);
-    const wastePct = dailyProd > 0 ? (wasteAmt / dailyProd) * 100 : 0;
-    const bottled = formData.entities.reduce((sum, entity) => sum + Number(entity.quantity || 0), 0);
+    // حساب القيم الموحدة من محرك الحسابات
+    const calculated = calculateReport(formData);
+    
+    if (calculated) {
+      // تحديث النموذج بالقيم المحسوبة
+      setFormData(prev => ({
+        ...prev,
+        operatingHours: calculated.operatingHours,
+        fuelConsumed: calculated.fuelConsumed,
+        currentFuelBalance: calculated.currentFuelBalance,
+        dailyProduction: calculated.dailyProduction,
+        waste: calculated.waste,
+        wastePercentage: calculated.wastePercentage,
+        bottledWater: calculated.bottledWater
+      }));
 
-    setFormData(prev => ({
-      ...prev, operatingHours: hours, fuelConsumed: consumed, currentFuelBalance: currentBal,
-      dailyProduction: dailyProd, waste: wasteAmt, wastePercentage: wastePct, bottledWater: bottled
-    }));
+      // التحقق من صحة البيانات
+      const validation = validateReport(formData);
+      setValidationResult(validation);
 
-    const newAlerts = [];
-    if (bottled > dailyProd && dailyProd > 0) newAlerts.push('كمية المياه المعبأة تتجاوز الإنتاج الفعلي لهذا اليوم!');
-    if (currentBal < 400 && currentBal > 0) newAlerts.push('تنبيه: مخزون الوقود المتبقي منخفض (أقل من 400 لتر)');
-    if (wastePct > 45) newAlerts.push('تنبيه: نسبة العادم المسجلة مرتفعة بشكل غير اعتيادي');
-    setAlerts(newAlerts);
+      // عرض التنبيهات فقط (بدون الأخطاء هنا)
+      setAlerts(validation.warnings);
+    }
   }, [
-    formData.startTime, formData.endTime, formData.fuelAdded, formData.fuelFromMunicipality, 
-    formData.fuelDifference, formData.previousFuelBalance, formData.submersibleProduction, 
-    formData.afterFilterProduction, formData.entities
+    formData.startTime, 
+    formData.endTime, 
+    formData.fuelAdded, 
+    formData.fuelFromMunicipality, 
+    formData.fuelDifference, 
+    formData.previousFuelBalance, 
+    formData.submersibleProduction, 
+    formData.afterFilterProduction, 
+    formData.entities
   ]);
 
   const handleInputChange = (e) => {
@@ -188,17 +189,44 @@ const AddReport = () => {
 
   const saveReport = async () => {
     try {
+      // التحقق من الأخطاء الحرجة
+      const validation = validateReport(formData);
+      
+      if (validation.errors.length > 0) {
+        // عرض الأخطاء الحرجة
+        const errorMessage = validation.errors.join('\n');
+        toast.error(`لا يمكن حفظ التقرير:\n${errorMessage}`, {
+          duration: 5,
+          style: {
+            whiteSpace: 'pre-line'
+          }
+        });
+        return;
+      }
+
       setLoading(true);
+      
+      // استخدام البيانات المحسوبة
+      const calculatedData = validation.calculated;
+      
       const reportData = {
-        ...formData, updatedAt: serverTimestamp(), updatedBy: currentUser.uid,
-        status: alerts.length > 0 ? 'تنبيهات' : 'سليم', alerts
+        ...calculatedData,
+        updatedAt: serverTimestamp(),
+        updatedBy: currentUser.uid,
+        status: validation.warnings.length > 0 ? 'تنبيهات' : 'سليم',
+        alerts: validation.warnings
       };
+
       if (isEdit) {
         await updateDoc(doc(db, 'reports', id), reportData);
         await logAction('تعديل تقرير', `تعديل تقرير ${formData.station} - ${formData.date}`, userData);
         toast.success('تم التحديث بنجاح');
       } else {
-        await addDoc(collection(db, 'reports'), { ...reportData, createdAt: serverTimestamp(), createdBy: currentUser.uid });
+        await addDoc(collection(db, 'reports'), { 
+          ...reportData, 
+          createdAt: serverTimestamp(), 
+          createdBy: currentUser.uid 
+        });
         await logAction('إضافة تقرير', `إضافة تقرير ${formData.station} - ${formData.date}`, userData);
         toast.success('تم الحفظ بنجاح');
       }
@@ -253,7 +281,7 @@ const AddReport = () => {
       </div>
       <div className="p-6 bg-primary-500/5 rounded-3xl border border-primary-500/10 flex items-center gap-4">
          <Info size={24} className="text-primary-500 shrink-0" />
-         <p className="text-xs font-bold text-slate-500 leading-relaxed">تنبيه: سيتم ربط كافة البيانات الرقمية المدخلة في الخطوات القادمة بحسابك الشخصي لضمان الدقة والمسؤولية.</p>
+         <p className="text-xs font-bold text-slate-500 leading-relaxed">تنبيه: سيتم ربط كافة البيانات الرقمية المدخلة في الخطوات القادمة بحسابات موحدة آلية</p>
       </div>
     </div>
   );
@@ -311,7 +339,7 @@ const AddReport = () => {
          </div>
          <div className="space-y-3">
             <label className="text-xs font-black text-slate-400 uppercase tracking-widest">المضاف اليوم</label>
-            <input type="number" name="fuelAdded" value={formData.fuelAdded} onChange={handleInputChange} className="input-field h-14 bg-slate-50 dark:bg-white/5 border-none font-black text-lg text-center" />
+            <input type="number" name="fuelAdded" value={formData.fuelAdded} onChange={handleInputChange} className="input-field h-14 bg-slate-50 dark:bg-white/5 border-none font-bold text-lg" />
          </div>
          <div className="space-y-3">
             <label className="text-xs font-black text-slate-400 uppercase tracking-widest">مستلم (البلدية)</label>
@@ -338,7 +366,7 @@ const AddReport = () => {
             </div>
             <div className="p-6 bg-slate-50 dark:bg-white/5 rounded-3xl border border-slate-100 dark:border-white/5">
                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">الفوارق / الأعطال</p>
-               <input type="number" name="fuelDifference" value={formData.fuelDifference} onChange={handleInputChange} className="bg-transparent border-none p-0 text-xl font-black w-full text-rose-600" />
+               <input type="number" name="fuelDifference" value={formData.fuelDifference} onChange={handleInputChange} className="bg-transparent border-none p-0 text-xl font-black w-full text-rose-500" />
             </div>
          </div>
       </div>
@@ -368,7 +396,7 @@ const AddReport = () => {
                   <span className="text-lg font-bold opacity-40">كوب</span>
                </div>
             </div>
-            <div className={`p-6 rounded-[32px] border-2 transition-all flex items-center justify-between ${formData.wastePercentage > 40 ? 'bg-rose-500/5 border-rose-500/20 text-rose-600' : 'bg-slate-500/5 border-slate-500/20 text-slate-600'}`}>
+            <div className={`p-6 rounded-[32px] border-2 transition-all flex items-center justify-between ${formData.wastePercentage > 40 ? 'bg-rose-500/5 border-rose-500/20 text-rose-600' : 'bg-emerald-500/5 border-emerald-500/20 text-emerald-600'}`}>
                <div>
                   <p className="text-[10px] font-black uppercase tracking-widest opacity-60">نسبة الفاقد (العادم)</p>
                   <p className="text-2xl font-black mt-1">{formData.wastePercentage.toFixed(1)}%</p>
@@ -406,7 +434,7 @@ const AddReport = () => {
       </div>
       <div className="p-6 bg-emerald-500/5 rounded-3xl border border-emerald-500/10 flex items-center gap-4">
          <ShieldCheck size={24} className="text-emerald-500 shrink-0" />
-         <p className="text-xs font-bold text-slate-500 leading-relaxed">المعايير المعتمدة لـ TDS المياه المحلاة هي (150-250)، يرجى مراجعة محطة المعالجة فوراً.</p>
+         <p className="text-xs font-bold text-slate-500 leading-relaxed">المعايير المعتمدة لـ TDS المياه المحلاة هي (150-250)، يرجى مراجعة محطة التحلية عند الانحراف</p>
       </div>
     </div>
   );
@@ -431,7 +459,7 @@ const AddReport = () => {
       <div className="space-y-4 max-h-[450px] overflow-y-auto custom-scrollbar pr-2">
          <AnimatePresence mode="popLayout">
            {formData.entities.length === 0 ? (
-             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex flex-col items-center justify-center py-20 bg-slate-50 dark:bg-white/5 rounded-[40px] border-2 border-dashed border-slate-200 dark:border-white/5 space-y-6">
+             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex flex-col items-center justify-center py-20 bg-slate-50 dark:bg-white/5 rounded-[40px] border-2 border-dashed border-slate-200 dark:border-white/5">
                 <Users size={48} className="opacity-10 mb-4" />
                 <p className="text-sm font-black uppercase tracking-widest">لا توجد جهات مسجلة</p>
              </motion.div>
@@ -446,17 +474,17 @@ const AddReport = () => {
                >
                  <div className="flex-1 w-full space-y-2">
                     <label className="text-[9px] font-black text-slate-400 uppercase tracking-tighter mr-2">الجهة المستلمة</label>
-                    <input type="text" value={en.name} onChange={e => setFormData(p => ({ ...p, entities: p.entities.map(it => it.id === en.id ? { ...it, name: e.target.value } : it) }))} className="input-field h-14 bg-white dark:bg-white/5 border-none font-black text-lg" />
+                    <input type="text" value={en.name} onChange={e => setFormData(p => ({ ...p, entities: p.entities.map(it => it.id === en.id ? { ...it, name: e.target.value } : it) }))} className="input-field h-12 bg-slate-50 dark:bg-white/5 border-none font-bold" />
                  </div>
                  <div className="w-full md:w-32 space-y-2">
                     <label className="text-[9px] font-black text-slate-400 uppercase tracking-tighter mr-2">الكمية (كوب)</label>
-                    <input type="number" value={en.quantity} onChange={e => setFormData(p => ({ ...p, entities: p.entities.map(it => it.id === en.id ? { ...it, quantity: Number(e.target.value) } : it) }))} className="input-field h-14 bg-white dark:bg-white/5 border-none font-black text-lg text-center" />
+                    <input type="number" value={en.quantity} onChange={e => setFormData(p => ({ ...p, entities: p.entities.map(it => it.id === en.id ? { ...it, quantity: Number(e.target.value) } : it) }))} className="input-field h-12 bg-slate-50 dark:bg-white/5 border-none font-bold" />
                  </div>
                  <div className="w-full md:w-28 space-y-2">
                     <label className="text-[9px] font-black text-slate-400 uppercase tracking-tighter mr-2">السيارات</label>
-                    <input type="number" value={en.cars} onChange={e => setFormData(p => ({ ...p, entities: p.entities.map(it => it.id === en.id ? { ...it, cars: Number(e.target.value) } : it) }))} className="input-field h-14 bg-white dark:bg-white/5 border-none font-black text-lg text-center" />
+                    <input type="number" value={en.cars} onChange={e => setFormData(p => ({ ...p, entities: p.entities.map(it => it.id === en.id ? { ...it, cars: Number(e.target.value) } : it) }))} className="input-field h-12 bg-slate-50 dark:bg-white/5 border-none font-bold" />
                  </div>
-                 <button onClick={() => setFormData(p => ({ ...p, entities: p.entities.filter(it => it.id !== en.id) }))} className="mt-6 md:mt-0 p-3 text-rose-500 hover:bg-rose-500 hover:text-white transition-all flex items-center justify-center">
+                 <button onClick={() => setFormData(p => ({ ...p, entities: p.entities.filter(it => it.id !== en.id) }))} className="mt-6 md:mt-0 p-3 text-rose-500 hover:bg-rose-500 hover:text-white rounded-2xl transition-all">
                     <Trash2 size={20} />
                  </button>
                </motion.div>
@@ -479,7 +507,7 @@ const AddReport = () => {
                </div>
                <div className="text-right border-r border-white/10 pr-4">
                   <p className="text-[9px] font-black uppercase tracking-widest opacity-30">المتوسط</p>
-                  <p className="text-xl font-black">{formData.entities.reduce((s, e) => s + Number(e.cars || 0), 0) > 0 ? (formData.bottledWater / formData.entities.reduce((s, e) => s + Number(e.cars || 0), 0)).toFixed(1) : 0} <span className="text-xs opacity-40">L/Car</span></p>
+                  <p className="text-xl font-black">{formData.entities.reduce((s, e) => s + Number(e.cars || 0), 0) > 0 ? (formData.bottledWater / formData.entities.reduce((s, e) => s + Number(e.cars || 0), 0)).toFixed(2) : 0}</p>
                </div>
             </div>
          </div>
@@ -491,12 +519,23 @@ const AddReport = () => {
     <div className="space-y-10 py-4">
        <StepHeader title="المراجعة النهائية والاعتماد" subtitle="تأكيد سلامة البيانات قبل الحفظ" icon={<ShieldCheck size={32} />} />
        
-       {alerts.length > 0 && (
+       {validationResult && validationResult.warnings.length > 0 && (
           <div className="space-y-3">
-            {alerts.map((alert, idx) => (
-              <motion.div key={idx} initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="p-5 bg-rose-500/10 border border-rose-500/20 rounded-3xl flex items-center gap-4 text-rose-600">
+            {validationResult.warnings.map((warning, idx) => (
+              <motion.div key={idx} initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="p-5 bg-amber-500/10 border border-amber-500/20 rounded-3xl flex items-center gap-4 text-amber-700 dark:text-amber-400">
                  <AlertCircle size={24} className="shrink-0" />
-                 <p className="text-sm font-bold">{alert}</p>
+                 <p className="text-sm font-bold">{warning}</p>
+              </motion.div>
+            ))}
+          </div>
+       )}
+
+       {validationResult && validationResult.errors.length > 0 && (
+          <div className="space-y-3">
+            {validationResult.errors.map((error, idx) => (
+              <motion.div key={idx} initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="p-5 bg-rose-500/10 border border-rose-500/20 rounded-3xl flex items-center gap-4 text-rose-700 dark:text-rose-400">
+                 <AlertCircle size={24} className="shrink-0" />
+                 <p className="text-sm font-bold">{error}</p>
               </motion.div>
             ))}
           </div>
@@ -521,7 +560,7 @@ const AddReport = () => {
 
        <div className="p-8 bg-primary-600/5 rounded-[32px] border border-primary-500/10 flex gap-4">
           <Info className="text-primary-500 shrink-0" size={24} />
-          <p className="text-sm font-bold text-slate-500 leading-relaxed">بالضغط على زر الحفظ، سيتم ترحيل البيانات إلى قاعدة البيانات السحابية وتحديث كافة مؤشرات الأداء بشكل مباشر.</p>
+          <p className="text-sm font-bold text-slate-500 leading-relaxed">بالضغط على زر الحفظ، سيتم ترحيل البيانات إلى قاعدة البيانات السحابية مع تسجيل جميع التغييرات</p>
        </div>
     </div>
   );
@@ -548,8 +587,8 @@ const AddReport = () => {
        </div>
        <div className="space-y-4 max-w-md">
           <h2 className="text-3xl font-black text-slate-900 dark:text-white">وضع الصيانة مفعل</h2>
-          <p className="text-slate-500 dark:text-slate-400 font-medium">نعتذر، تم تعليق إدخال التقارير الميدانية مؤقتاً لإجراء صيانة دورية للنظام. يرجى المحاولة لاحقاً.</p>
-          <button onClick={() => navigate('/dashboard')} className="px-8 py-3 bg-slate-900 dark:bg-white text-white dark:text-slate-900 rounded-2xl font-black transition-all hover:scale-105 active:scale-95">العودة للوحة البيانات</button>
+          <p className="text-slate-500 dark:text-slate-400 font-medium">نعتذر، تم تعليق إدخال التقارير الميدانية مؤقتاً لإجراء صيانة دورية للنظام</p>
+          <button onClick={() => navigate('/dashboard')} className="px-8 py-3 bg-slate-900 dark:bg-white text-white dark:text-slate-900 rounded-2xl font-black transition-all hover:scale-105 active:scale-95">العودة للصفحة الرئيسية</button>
        </div>
     </div>
   );
@@ -622,7 +661,7 @@ const AddReport = () => {
         <button 
           onClick={() => setCurrentStep(Math.max(1, currentStep - 1))} 
           disabled={currentStep === 1}
-          className="px-8 py-4 bg-white dark:bg-slate-800 text-slate-500 dark:text-slate-300 rounded-3xl font-black shadow-xl border border-slate-100 dark:border-white/10 disabled:opacity-50 transition-all"
+          className="px-8 py-4 bg-white dark:bg-slate-800 text-slate-500 dark:text-slate-300 rounded-3xl font-black shadow-xl border border-slate-100 dark:border-white/10 disabled:opacity-50 transition-all hover:scale-105 active:scale-95"
         >
           <ChevronRight size={20} /> السابق
         </button>
